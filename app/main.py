@@ -14,6 +14,8 @@ from .schemas import (
     CertificateOut,
     EvaluationOut,
     IssueRequest,
+    ReadingBatchSubmit,
+    ReadingBatchSubmitResponse,
     ReadingOut,
     ReadingSubmit,
     ReadingSubmitResponse,
@@ -36,11 +38,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
-        "支持读数修订、幂等提交、证书版本化签发，"
+        "支持读数单条/批次补传提交、幂等、修订、证书版本化签发，"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告。"
     ),
     lifespan=lifespan,
@@ -127,6 +129,34 @@ def submit_reading(
         effect, reading = services.submit_reading(conn, window_id, payload)
         evaluation = services.compute_evaluation(conn, win)
         return {"effect": effect, "reading": reading, "current_evaluation": evaluation}
+
+
+@app.post(
+    "/api/v1/windows/{window_id}/readings/batch",
+    response_model=ReadingBatchSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["readings"],
+)
+def submit_reading_batch(
+    window_id: int,
+    payload: ReadingBatchSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """采样仪器补传：按审定窗口一次提交一个非空读数批次。
+
+    每项沿用单条提交的 reading_id/revision/measured_at/temperature 与
+    时区、窗口边界、幂等/修订/冲突规则；同批 reading_id 不得重复。
+    同刻唯一性按整批应用后的最终状态校验（允许两条读数以更高修订号
+    互换采样时刻，不因写入顺序误拒）。任一项冲突或无效整批拒收，
+    活动读数与修订历史均不改变；成功则一次提交全部变化，逐项返回
+    created/updated/idempotent 及读数，并返回按最终状态重算的审定结果。
+    """
+    # 单个写事务：整批校验通过后才统一写入，随后基于最终状态重算
+    with write_transaction(conn):
+        win = services.get_window_row(conn, window_id)
+        effects = services.submit_reading_batch(conn, window_id, payload.readings)
+        evaluation = services.compute_evaluation(conn, win)
+        return {"effects": effects, "current_evaluation": evaluation}
 
 
 # ---------------------------------------------------------------- 签发

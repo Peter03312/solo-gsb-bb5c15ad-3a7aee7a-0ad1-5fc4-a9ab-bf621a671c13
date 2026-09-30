@@ -9,7 +9,10 @@
   1) 创建三个审定窗口，分别得到 待定 / 不合格 / 合格；
   2) 幂等提交、同修订号内容冲突 409、旧修订号 409、高修订号替换重算；
   3) 窗口外读数、同刻读数拒收；
-  4) 首次签发、修订后再次签发形成新版本，旧版本快照保持不变。
+  4) 首次签发、修订后再次签发形成新版本，旧版本快照保持不变；
+  5) 采样仪器批次补传：整批 created/updated/idempotent、重放幂等、
+     两条读数以更高修订号互换采样时刻（不因写入顺序误拒）、
+     任一项冲突/无效整批拒收、已签发快照不随补传变化。
 """
 from __future__ import annotations
 
@@ -19,7 +22,6 @@ import urllib.error
 import urllib.request
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-
 
 def call(method: str, path: str, body: dict | None = None, expect=(200, 201)):
     data = json.dumps(body).encode() if body is not None else None
@@ -69,6 +71,18 @@ def submit(wid, rid, rev, minute, temp, minute_end=60):
     return call("POST", f"/api/v1/windows/{wid}/readings",
                 {"reading_id": rid, "revision": rev,
                  "measured_at": ts, "temperature": temp})
+
+
+def submit_batch(wid, items):
+    """采样仪器补传：items 为 [{reading_id, revision, measured_at, temperature}, ...]。"""
+    return call("POST", f"/api/v1/windows/{wid}/readings/batch",
+                {"readings": items})
+
+
+def item(rid, rev, minute, temp):
+    return {"reading_id": rid, "revision": rev,
+            "measured_at": f"2026-10-01T00:{minute:02d}:00Z",
+            "temperature": temp}
 
 
 def main() -> None:
@@ -201,6 +215,54 @@ def main() -> None:
     assert call("GET", f"/api/v1/certificates/revision-report"
                        f"?old_certificate_id={c1['id']}&new_certificate_id=99999")[0] == 404
     print("倒序/同 ID 已拒绝（422），不存在证书已拒绝（404）")
+
+    # ---------- 采样仪器批次补传 ----------
+    show("采样仪器补传：批次提交（整批校验、最终状态同刻唯一、重放幂等）")
+    wb = create_window("展柜D-批次补传", 10, max_exceed=300, max_gap=600)
+
+    # 1) 一次提交多条：全部 created，审定按最终状态重算
+    code, r = submit_batch(wb, [item("a", 1, 0, 20.0), item("b", 1, 2, 23.0),
+                                item("c", 1, 4, 20.0), item("d", 1, 6, 20.0)])
+    assert code == 201, r
+    print("整批提交：", [(e["reading_id"], e["effect"]) for e in r["effects"]],
+          "->", summary(r["current_evaluation"]))
+    assert [e["effect"] for e in r["effects"]] == ["created"] * 4
+
+    # 2) 同批重放：全部 idempotent，不产生新修订
+    code, r = submit_batch(wb, [item("a", 1, 0, 20.0), item("b", 1, 2, 23.0)])
+    print("同批重放：", [e["effect"] for e in r["effects"]])
+    assert [e["effect"] for e in r["effects"]] == ["idempotent", "idempotent"]
+
+    # 3) 两条读数以更高修订号互换采样时刻；先提“占用目标时刻”的 a，也不得误拒
+    code, r = submit_batch(wb, [item("a", 2, 2, 20.0), item("b", 2, 0, 23.0)])
+    print("互换时刻（顺序 a 先）：", code,
+          [(e["reading_id"], e["effect"], e["reading"]["measured_at"][11:19])
+           for e in r["effects"]])
+    assert code == 201
+    rows = {x["reading_id"]: x for x in call("GET", f"/api/v1/windows/{wb}/readings")[1]}
+    assert rows["a"]["measured_at"] == "2026-10-01T00:02:00Z"
+    assert rows["b"]["measured_at"] == "2026-10-01T00:00:00Z"
+
+    # 4) 任一项冲突/无效整批拒收，活动读数与修订历史不变
+    before = call("GET", f"/api/v1/windows/{wb}/readings")[1]
+    code, r = submit_batch(wb, [item("new", 1, 9, 20.0),
+                                item("a", 1, 2, 99.9)])  # a 的 rev1 历史内容冲突
+    print("批次内含冲突项：", code, "整批拒收")
+    assert code == 409
+    code, r = submit_batch(wb, [item("x", 1, 8, 20.0), item("x", 2, 9, 20.0)])
+    print("批次内 reading_id 重复：", code)
+    assert code == 422
+    after = call("GET", f"/api/v1/windows/{wb}/readings")[1]
+    assert before == after, "拒收批次不得改变活动读数"
+    assert all(x["reading_id"] != "new" for x in after)
+
+    # 5) 补传后签发：已签发快照不受后续批次影响
+    cert = call("POST", f"/api/v1/windows/{wb}/certificates/issue", {"note": "补传前"})[1]
+    snap = call("GET", f"/api/v1/certificates/{cert['id']}")[1]["snapshot"]
+    submit_batch(wb, [item("c", 2, 4, 20.1), item("e", 1, 8, 20.0)])
+    snap_after = call("GET", f"/api/v1/certificates/{cert['id']}")[1]["snapshot"]
+    assert snap == snap_after
+    print("补传后旧证书快照仍为", cert["version"], "版，读数数", len(snap["readings"]))
 
     print("\n全部示例执行完成 ✔")
 

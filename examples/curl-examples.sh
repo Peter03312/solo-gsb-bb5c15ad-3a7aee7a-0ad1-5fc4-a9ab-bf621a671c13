@@ -47,6 +47,57 @@ api POST "/api/v1/windows/$WID/readings" '{"reading_id":"r-01","revision":1,"mea
 api POST "/api/v1/windows/$WID/readings" '{"reading_id":"r-01","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":20.0}' || true
 api POST "/api/v1/windows/$WID/readings" '{"reading_id":"r-01","revision":2,"measured_at":"2026-10-01T00:10:00Z","temperature":20.0}'
 
+echo "== 5b. 采样仪器补传：批次提交（独立窗口 W2，一次提交多条）=="
+W2=$(api POST /api/v1/windows '{
+  "name": "展柜B-批次补传",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600
+}')
+W2ID=$(echo "$W2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "-- 整批 created：逐项 effect + 按最终状态重算的审定 --"
+api POST "/api/v1/windows/$W2ID/readings/batch" '{
+  "readings": [
+    {"reading_id":"b-00","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.1},
+    {"reading_id":"b-01","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":20.2},
+    {"reading_id":"b-02","revision":1,"measured_at":"2026-10-01T00:20:00Z","temperature":20.3}
+  ]
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('effects=',[e['effect'] for e in d['effects']]);print('verdict=',d['current_evaluation']['verdict'])"
+
+echo "-- 同批重放：全部 idempotent，不产生新修订 --"
+api POST "/api/v1/windows/$W2ID/readings/batch" '{
+  "readings": [
+    {"reading_id":"b-00","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.1},
+    {"reading_id":"b-01","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":20.2}
+  ]
+}' | python3 -c "import sys,json;print('effects=',[e['effect'] for e in json.load(sys.stdin)['effects']])"
+
+echo "-- 两条读数以更高修订号互换采样时刻（与批次内顺序无关，这里先提 b-00）--"
+api POST "/api/v1/windows/$W2ID/readings/batch" '{
+  "readings": [
+    {"reading_id":"b-00","revision":2,"measured_at":"2026-10-01T00:10:00Z","temperature":20.1},
+    {"reading_id":"b-01","revision":2,"measured_at":"2026-10-01T00:00:00Z","temperature":20.2}
+  ]
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('effects=',[(e['reading_id'],e['effect'],e['reading']['measured_at']) for e in d['effects']])"
+
+echo "-- 任一项冲突/无效整批拒收：下面批次含同批重复 reading_id -> 422，状态不变 --"
+api POST "/api/v1/windows/$W2ID/readings/batch" '{
+  "readings": [
+    {"reading_id":"b-09","revision":1,"measured_at":"2026-10-01T00:30:00Z","temperature":20.0},
+    {"reading_id":"b-09","revision":2,"measured_at":"2026-10-01T00:40:00Z","temperature":20.0}
+  ]
+}' || true
+echo "-- 批次内旧修订号/内容冲突 -> 409，整批不写入 --"
+api POST "/api/v1/windows/$W2ID/readings/batch" '{
+  "readings": [
+    {"reading_id":"b-08","revision":1,"measured_at":"2026-10-01T00:30:00Z","temperature":20.0},
+    {"reading_id":"b-00","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":99.9}
+  ]
+}' || true
+
 echo "== 6. 补齐整窗读数（间隔 <= 600s；末尾含窗口终点读数作为覆盖终止采样）=="
 for min in 40 50 60; do
   if [[ "$min" -eq 60 ]]; then ts="2026-10-01T01:00:00Z"; else ts="2026-10-01T00:$min:00Z"; fi
@@ -70,7 +121,7 @@ api GET "/api/v1/windows/$WID/certificates" | python3 -m json.tool
 echo "== 11. 修订影响报告：比对 v1/v2 两张已签发证书的不可变快照 =="
 # 从版本列表取两个证书主键 ID
 mapfile -t CIDS < <(api GET "/api/v1/windows/$WID/certificates" \
-  | python3 -c "import sys,json;print(*[c['id'] for c in json.load(sys.stdin)])")
+  | python3 -c "import sys,json;[print(c['id']) for c in json.load(sys.stdin)]")
 OLD_ID="${CIDS[0]}"; NEW_ID="${CIDS[1]}"
 api GET "/api/v1/certificates/revision-report?old_certificate_id=$OLD_ID&new_certificate_id=$NEW_ID" \
   | python3 -m json.tool

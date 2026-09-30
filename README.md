@@ -10,6 +10,15 @@
 - 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
 - 无外部服务依赖，`docker compose up -d` 一键启动并自动初始化数据库
 
+> **v1.2.0 新增（采样仪器补传）**：`POST
+> /api/v1/windows/{id}/readings/batch` 支持按审定窗口提交非空读数批次，
+> 逐项沿用单条提交的时区、窗口边界与修订规则；批次内 `reading_id` 唯一，
+> 同刻唯一按批次最终状态校验（允许两条读数以更高修订号互换采样时刻，
+> 与写入顺序无关），任一项冲突或无效整批拒收且不留痕，成功一次提交并
+> 逐项返回 created/updated/idempotent 及按最终状态重算的审定；同批重放
+> 幂等不增修订。单条提交与证书签发保持不变，已签发快照不随补传变化。
+> 详见下文“批次补传”一节。
+
 ---
 
 ## 1. 审定规则
@@ -55,6 +64,11 @@
 - **旧修订号**（低于当前修订号）→ **409 拒绝**。
 - 同一窗口内不同读数不允许同一时间戳 → **422 拒收**。
 - 时间戳超出 `[start_at, end_at]` → **422 拒收**；所有时间戳必须带时区。
+- **批次补传**（`POST .../readings/batch`）在同一事务内整批提交一个非空
+  批次：逐项沿用上述规则，批次内 `reading_id` 不得重复；同刻唯一按整批
+  **最终状态**校验，因此两条读数可同批以更高修订号互换采样时刻；任一
+  项冲突或无效整批拒收，活动读数与修订历史不变；成功逐项返回
+  created/updated/idempotent，同批重放不产生新修订。
 
 ### 签发与并发
 
@@ -146,9 +160,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/v1/windows/{id}/readings` | 提交/幂等重放/修订一条读数，响应含重算结果 |
+| `POST` | `/api/v1/windows/{id}/readings/batch` | 采样仪器补传：非空读数批次一次提交（整批校验、整批落库），逐项返回结果与按最终状态重算的审定 |
 | `GET` | `/api/v1/windows/{id}/readings` | 当前活动读数列表（按时间升序） |
 
-读数请求体：
+读数请求体（单条）：
 
 ```json
 { "reading_id": "r-01", "revision": 1,
@@ -156,6 +171,51 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 响应中的 `effect` 为 `created` / `updated` / `idempotent`。
+
+#### 批次补传（`POST .../readings/batch`）
+
+采样仪器离线回联后，可按审定窗口**一次提交一个非空读数批次**：
+
+```json
+{
+  "readings": [
+    { "reading_id": "r-01", "revision": 1, "measured_at": "2026-10-01T00:10:00Z", "temperature": 22.4 },
+    { "reading_id": "r-02", "revision": 1, "measured_at": "2026-10-01T00:20:00Z", "temperature": 20.5 }
+  ]
+}
+```
+
+规则（与单条提交共用同一套语义）：
+
+- 每项沿用现有 `reading_id`、`revision`、`measured_at`、`temperature`，
+  以及单条提交的**时区归一、窗口闭区间边界、幂等/修订/冲突规则**
+  （相同 ID+修订号内容一致幂等、不一致 409；旧修订号 409；更高修订号替换）。
+- 同一批次内 `reading_id` 不得重复 → `422`；`readings` 为空 → `422`。
+- **同刻唯一按整批应用后的最终状态校验**，与批次内排列顺序无关：
+  允许两条读数在同一批次中**各自以更高修订号互换采样时刻**
+  （例如 a rev2 落到 b 的旧时刻、b rev2 落到 a 的旧时刻），
+  不会因为先写哪一条而误拒；若某读数占用的目标时刻最终仍属于另一条
+  未腾位的读数，仍返回 `422`。
+- **任一项冲突或无效，整批拒收**：活动读数与修订历史均不改变
+  （全部校验通过后才在单个事务里一次写入），错误码与 `detail` 沿用
+  现有冲突（`409`）与校验（`422`）语义。
+- 成功时一次提交全部变化，**逐项**返回 `created` / `updated` /
+  `idempotent` 及该读数最终内容（顺序与请求一致），并返回
+  **按批次最终状态重算**的审定结果；同批重放只返回 `idempotent`，
+  不产生新修订历史。
+- 已签发证书是不可变快照，**不随后续补传变化**；补传后再次签发产生新版本。
+
+响应示例：
+
+```json
+{
+  "effects": [
+    {"reading_id": "r-01", "effect": "created", "reading": { "...": "..." }},
+    {"reading_id": "r-02", "effect": "updated", "reading": { "...": "..." }}
+  ],
+  "current_evaluation": { "verdict": "pending", "...": "..." }
+}
+```
 
 ### 审定结果结构
 
@@ -271,8 +331,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 错误约定
 
 - `404`：窗口/证书不存在（修订影响报告中任一证书缺失）
-- `409`：同 ID+修订号内容冲突；旧修订号覆盖
+- `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批次提交语义一致；
+  批次中任一读数 409 时整批拒收、不写入任何一项）
 - `422`：无效窗口、窗口外读数、同刻不同读数、缺时区/字段非法等；
+  批次提交中的空批次、批次内 `reading_id` 重复同样返回 422
+  （任一读数 422 时整批拒收、不写入任何一项）；
   修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422
 
 ---
@@ -282,13 +345,34 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告）
+# curl 全流程（创建窗口 → 单条提交/幂等/冲突/修订 → 批次补传/互换时刻/整批拒收
+#             → 审定 → 两次签发 → 修订影响报告）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、
+# 批次补传整批事务与同刻互换）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
+```
+
+批次补传最小示例（非空 `readings`，逐项同单条规则；整批成功或整批拒收）：
+
+```bash
+curl -sS http://localhost:8000/api/v1/windows/1/readings/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"readings":[
+    {"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.1},
+    {"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:05:00Z","temperature":20.2}
+  ]}'
+
+# 两条读数同批以更高修订号互换采样时刻（顺序无关）
+curl -sS http://localhost:8000/api/v1/windows/1/readings/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"readings":[
+    {"reading_id":"a","revision":2,"measured_at":"2026-10-01T00:05:00Z","temperature":20.1},
+    {"reading_id":"b","revision":2,"measured_at":"2026-10-01T00:00:00Z","temperature":20.2}
+  ]}'
 ```
 
 修订影响报告最小示例（`OLD_ID`、`NEW_ID` 为同一窗口两张已签发证书主键）：
@@ -330,6 +414,10 @@ PYTHONPATH=. python -m pytest tests/ -q
   区段、边界对齐、未知来源、区间合并、汇总方向）。
 - `tests/test_api.py`：HTTP 集成测试（幂等、冲突、修订替换、拒收、
   证书版本快照、签发/修订并发串行化）。
+- `tests/test_batch_api.py`：批次补传 HTTP 测试（整批 created/混合效果、
+  空批次/批内重复 ID/最终同刻整批拒收、内容冲突与旧修订号 409 回滚、
+  两条读数以更高修订号互换采样时刻的两种写入顺序、三读轮换、
+  重放幂等不增修订、已签发快照不随补传变化、与单条提交共存）。
 - `tests/test_report_api.py`：修订影响报告 HTTP 测试（fail→pass、
   边界空白 vs 采样间隔超限、只依快照、跨窗口/倒序/同 ID/不存在拒绝）。
 
