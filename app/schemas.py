@@ -78,6 +78,21 @@ class ReadingSubmit(BaseModel):
         return v
 
 
+class ReadingBatchSubmit(BaseModel):
+    """采样仪器补传：一个审定窗口下的一批非空读数。
+
+    批次在单个写事务内整体校验、整体提交：任一项冲突或无效即整批拒收
+    （活动读数与修订历史均不变）。每项沿用单条提交的 reading_id / revision /
+    measured_at / temperature 语义与时区、窗口边界、修订规则；同批不得
+    重复 reading_id；同刻唯一按“批次应用后的最终状态”校验，允许两条读数
+    以更高修订号互换采样时刻。
+    """
+
+    readings: list[ReadingSubmit] = Field(
+        ..., min_length=1, description="非空读数批次（至少 1 项）；同批 reading_id 不得重复"
+    )
+
+
 class IssueRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=500, description="签发备注")
 
@@ -130,6 +145,20 @@ class ReadingSubmitResponse(BaseModel):
     effect: str = Field(..., description="created | updated | idempotent")
     reading: ReadingOut
     current_evaluation: EvaluationOut
+
+
+class ReadingBatchItemResult(BaseModel):
+    effect: str = Field(..., description="created | updated | idempotent")
+    reading: ReadingOut
+
+
+class ReadingBatchSubmitResponse(BaseModel):
+    results: list[ReadingBatchItemResult] = Field(
+        ..., description="逐项结果，顺序与请求一致；每项给出 created/updated/idempotent 及最终读数"
+    )
+    current_evaluation: EvaluationOut = Field(
+        ..., description="按批次最终状态一次性重算的审定结果"
+    )
 
 
 class CertificateOut(BaseModel):

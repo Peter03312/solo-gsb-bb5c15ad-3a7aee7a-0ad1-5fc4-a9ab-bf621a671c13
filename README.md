@@ -3,6 +3,7 @@
 对博物馆展柜在指定**审定窗口**内采集到的温度读数进行暴露审定：按时间排序后，
 以“每条读数只覆盖到下一条读数”的采样保持语义切分区段，识别 **正常 / 超限 / 未知**
 区段，计算**最长连续超限时长**，并给出审定结论；支持读数幂等提交、修订替换、
+**采样仪器按审定窗口批量补传（整批事务、互换时刻、重放不产生新修订）**、
 证书版本化签发（快照不可变），并可对同一审定窗口的两张已签发证书生成
 **修订影响报告**（只读快照比对：读数新增/变更、时间线状态变化半开区间、
 结论与最长连续超限时长变化）。
@@ -55,6 +56,27 @@
 - **旧修订号**（低于当前修订号）→ **409 拒绝**。
 - 同一窗口内不同读数不允许同一时间戳 → **422 拒收**。
 - 时间戳超出 `[start_at, end_at]` → **422 拒收**；所有时间戳必须带时区。
+
+### 批量补传（采样仪器）
+
+`POST /api/v1/windows/{id}/readings/batch` 在**单个写事务**内整批提交一个
+**非空**读数批次（请求体 `{"readings": [...]}`，单项结构与单条提交完全相同）：
+
+- 每项沿用现有 `reading_id`、`revision`、`measured_at`、`temperature`，
+  以及单条提交的时区、窗口闭区间边界、幂等/修订/冲突语义；
+  **同批不得重复 `reading_id`**（否则 **422**）。
+- 同刻唯一按**批次应用后的最终状态**校验，而不是按写入顺序逐条校验：
+  因此允许两条读数都以更高修订号**互换采样时刻**（`a`、`b` 互相改到对方
+  原时刻），不会因中间状态误拒；最终状态下仍同刻则 **422 拒收**。
+- 任一项冲突（**409**：同 ID+修订号内容冲突、旧修订号覆盖）或无效
+  （**422**：窗口外、缺时区、最终状态同刻、批内重复 ID 等）→
+  **整批拒收**：活动读数与修订历史均不改变（沿用现有冲突与校验错误语义）。
+- 成功时**一次提交全部变化**，响应逐项给出 `created` / `updated` /
+  `idempotent` 及最终读数（顺序与请求一致），并返回**按最终状态一次性重算**
+  的审定结果 `current_evaluation`；**同批重放不产生新修订**（全部
+  `idempotent`，历史表不新增行）。
+- 批量补传与单条提交、证书签发互不影响：已签发证书快照不可变，补传后
+  再次签发形成新版本，旧版本内容保持不变。
 
 ### 签发与并发
 
@@ -146,6 +168,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/v1/windows/{id}/readings` | 提交/幂等重放/修订一条读数，响应含重算结果 |
+| `POST` | `/api/v1/windows/{id}/readings/batch` | 采样仪器补传：整批提交非空读数批次（整批事务），逐项返回 effect 与最终读数，响应含按最终状态重算的结果 |
 | `GET` | `/api/v1/windows/{id}/readings` | 当前活动读数列表（按时间升序） |
 
 读数请求体：
@@ -155,7 +178,21 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   "measured_at": "2026-10-01T00:10:00Z", "temperature": 22.4 }
 ```
 
-响应中的 `effect` 为 `created` / `updated` / `idempotent`。
+单条提交响应中的 `effect` 为 `created` / `updated` / `idempotent`。
+
+批量补传请求体与响应：
+
+```json
+// 请求：{ "readings": [ <读数>, <读数>, ... ] }（至少 1 项，同批 reading_id 唯一）
+{
+  "results": [
+    { "effect": "created", "reading": { "reading_id": "a", "revision": 1, "...": "..." } },
+    { "effect": "updated",   "reading": { "reading_id": "b", "revision": 2, "...": "..." } },
+    { "effect": "idempotent","reading": { "reading_id": "c", "revision": 1, "...": "..." } }
+  ],
+  "current_evaluation": { "verdict": "pass", "...": "..." }
+}
+```
 
 ### 审定结果结构
 
@@ -271,9 +308,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 错误约定
 
 - `404`：窗口/证书不存在（修订影响报告中任一证书缺失）
-- `409`：同 ID+修订号内容冲突；旧修订号覆盖
-- `422`：无效窗口、窗口外读数、同刻不同读数、缺时区/字段非法等；
+- `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）
+- `422`：无效窗口、窗口外读数、同刻不同读数（批量按最终状态判定）、
+  批量请求为空批次/同批 `reading_id` 重复、缺时区/字段非法等；
   修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422
+
+> 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
+> 不会出现“批内前几项已生效、后几项失败”的部分写入。
 
 ---
 
@@ -282,10 +323,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -315,6 +356,19 @@ curl -sS -X POST http://localhost:8000/api/v1/windows/1/certificates/issue \
   -H 'Content-Type: application/json' -d '{"note":"首签"}'
 ```
 
+批量补传最小示例（互换采样时刻：`a`、`b` 同时以更高修订号改到对方原时刻）：
+
+```bash
+# 先有 a@00:00 rev1、b@00:10 rev1，再整批互换时刻（按最终状态判同刻，顺序无关）
+curl -sS http://localhost:8000/api/v1/windows/1/readings/batch \
+  -H 'Content-Type: application/json' -d '{
+    "readings":[
+      {"reading_id":"a","revision":2,"measured_at":"2026-10-01T00:10:00Z","temperature":20.1},
+      {"reading_id":"b","revision":2,"measured_at":"2026-10-01T00:00:00Z","temperature":20.2}
+    ]}'
+# 原样重放同一批次 -> results 全部 idempotent，不产生新修订
+```
+
 ---
 
 ## 5. 测试
@@ -330,6 +384,9 @@ PYTHONPATH=. python -m pytest tests/ -q
   区段、边界对齐、未知来源、区间合并、汇总方向）。
 - `tests/test_api.py`：HTTP 集成测试（幂等、冲突、修订替换、拒收、
   证书版本快照、签发/修订并发串行化）。
+- `tests/test_batch_api.py`：批量补传 HTTP 集成测试（整批创建/混合 effect、
+  窗口外/同刻/重复 ID 整批原子回滚、409 冲突与旧修订号、活动表与历史表不变、
+  更高修订号互换时刻及顺序无关、重放不产生新修订、已签发快照不变、时区归一）。
 - `tests/test_report_api.py`：修订影响报告 HTTP 测试（fail→pass、
   边界空白 vs 采样间隔超限、只依快照、跨窗口/倒序/同 ID/不存在拒绝）。
 

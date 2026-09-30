@@ -9,7 +9,9 @@
   1) 创建三个审定窗口，分别得到 待定 / 不合格 / 合格；
   2) 幂等提交、同修订号内容冲突 409、旧修订号 409、高修订号替换重算；
   3) 窗口外读数、同刻读数拒收；
-  4) 首次签发、修订后再次签发形成新版本，旧版本快照保持不变。
+  4) 首次签发、修订后再次签发形成新版本，旧版本快照保持不变；
+  5) 采样仪器批量补传：整批事务、逐项 created/updated/idempotent、
+     互换采样时刻、整批冲突回滚、重放不产生新修订。
 """
 from __future__ import annotations
 
@@ -69,6 +71,17 @@ def submit(wid, rid, rev, minute, temp, minute_end=60):
     return call("POST", f"/api/v1/windows/{wid}/readings",
                 {"reading_id": rid, "revision": rev,
                  "measured_at": ts, "temperature": temp})
+
+
+def submit_batch(wid, items):
+    return call("POST", f"/api/v1/windows/{wid}/readings/batch",
+                {"readings": items})
+
+
+def item(rid, rev, minute, temp):
+    return {"reading_id": rid, "revision": rev,
+            "measured_at": f"2026-10-01T00:{minute:02d}:00Z",
+            "temperature": temp}
 
 
 def main() -> None:
@@ -201,6 +214,46 @@ def main() -> None:
     assert call("GET", f"/api/v1/certificates/revision-report"
                        f"?old_certificate_id={c1['id']}&new_certificate_id=99999")[0] == 404
     print("倒序/同 ID 已拒绝（422），不存在证书已拒绝（404）")
+
+    # ---------- 采样仪器批量补传（整批事务） ----------
+    show("批量补传：整批提交、最终状态同刻唯一、互换时刻、重放幂等")
+    wb = create_window("展柜D-批量补传", 10, max_exceed=300, max_gap=600)
+
+    code, r = submit_batch(wb, [item("a", 1, 0, 20.0), item("b", 1, 2, 23.0),
+                                item("c", 1, 9, 20.0)])
+    print("批量创建:", code, [x["effect"] for x in r["results"]],
+          "->", summary(r["current_evaluation"]))
+    assert code == 201 and [x["effect"] for x in r["results"]] == \
+        ["created", "created", "created"]
+
+    # 同批重放：全部幂等，不产生新修订
+    code, r = submit_batch(wb, [item("a", 1, 0, 20.0), item("b", 1, 2, 23.0),
+                                item("c", 1, 9, 20.0)])
+    print("同批重放:", [x["effect"] for x in r["results"]])
+    assert [x["effect"] for x in r["results"]] == ["idempotent"] * 3
+
+    # 两条读数以更高修订号互换采样时刻：按最终状态不冲突，顺序无关
+    code, r = submit_batch(wb, [item("a", 2, 2, 20.0), item("b", 2, 0, 20.0)])
+    print("互换时刻:", [(x["reading"]["reading_id"], x["effect"],
+                        x["reading"]["measured_at"][11:19]) for x in r["results"]])
+    assert [x["effect"] for x in r["results"]] == ["updated", "updated"]
+    rows = call("GET", f"/api/v1/windows/{wb}/readings")[1]
+    ts = {x["reading_id"]: x["measured_at"] for x in rows}
+    assert ts["a"].endswith("T00:02:00Z") and ts["b"].endswith("T00:00:00Z")
+
+    # 任一项冲突/无效 -> 整批拒收，活动读数与修订历史均不变
+    code, r = submit_batch(wb, [item("b", 1, 0, 20.0),   # 旧修订号 -> 409
+                                item("x", 1, 5, 20.0)])   # 本应 created，但一起回滚
+    print("含旧修订号的批次:", code, "（整批拒收，x 不落库）")
+    assert code == 409
+    code, r = submit_batch(wb, [item("a", 3, 3, 20.0), item("a", 3, 4, 20.0)])
+    print("同批重复 reading_id:", code)
+    assert code == 422
+    code, r = submit_batch(wb, [])
+    print("空批次:", code)
+    assert code == 422
+    ids_now = {x["reading_id"] for x in call("GET", f"/api/v1/windows/{wb}/readings")[1]}
+    assert ids_now == {"a", "b", "c"}
 
     print("\n全部示例执行完成 ✔")
 

@@ -10,7 +10,7 @@ from fastapi import HTTPException, status
 from .evaluation import evaluate
 from .models import VERDICT_LABELS_ZH
 from .report import build_revision_report
-from .schemas import ReadingSubmit, WindowCreate
+from .schemas import ReadingBatchSubmit, ReadingSubmit, WindowCreate
 from .timeutils import parse_stored, to_iso, to_utc
 
 
@@ -191,6 +191,184 @@ def submit_reading(
         (window_id, payload.reading_id),
     ).fetchone()
     return effect, reading_to_dict(active_row)
+
+
+def submit_reading_batch(
+    conn: sqlite3.Connection, window_id: int, payload: ReadingBatchSubmit
+) -> list[tuple[str, dict[str, Any]]]:
+    """批量补传读数：整批校验、整批落库，返回与请求同序的 [(effect, reading_dict)]。
+
+    调用方需已持有写事务。任一单项冲突或无效即抛 HTTPException，由事务
+    上下文整体回滚（活动读数与修订历史均不变）。每项沿用 submit_reading
+    的窗口边界、时区、修订与冲突语义，差异在于：
+
+    - 同批 reading_id 不得重复（422）；
+    - 同刻唯一按“批次全部应用后的最终状态”校验，因此允许两条读数都以更高
+      修订号互换采样时刻，不按写入顺序误拒；
+    - 校验全部通过后一次提交全部变化。
+    """
+    win = get_window_row(conn, window_id)
+    win_start = parse_stored(win["start_at"])
+    win_end = parse_stored(win["end_at"])
+
+    # ---- 1) 批内重复 reading_id（422） ----
+    seen_ids: set[str] = set()
+    for p in payload.readings:
+        if p.reading_id in seen_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"批次拒收：reading_id {p.reading_id} 在同批中重复，同批不得重复 reading_id",
+            )
+        seen_ids.add(p.reading_id)
+
+    # 现有活动读数与修订历史（批前快照，整个事务内没有其它写入方）
+    active_rows = conn.execute(
+        "SELECT * FROM readings WHERE window_id=?", (window_id,)
+    ).fetchall()
+    active: dict[str, sqlite3.Row] = {r["reading_id"]: r for r in active_rows}
+    hist_rows = conn.execute(
+        "SELECT * FROM reading_revisions WHERE window_id=?", (window_id,)
+    ).fetchall()
+    history: dict[tuple[str, int], sqlite3.Row] = {
+        (r["reading_id"], r["revision"]): r for r in hist_rows
+    }
+
+    # ---- 2) 逐项校验：窗口边界、修订号、内容冲突；得到最终状态 ----
+    # final[reading_id] = (revision, measured_iso, temperature, effect)
+    final: dict[str, tuple[int, str, float, str]] = {}
+    # 活动行缺失但历史行存在的幂等项：需把活动行补回（与单条提交同语义）
+    recreate_active: set[str] = set()
+    for p in payload.readings:
+        measured = to_utc(p.measured_at)
+        # 窗口对读数提交为闭区间 [start, end]（与单条提交一致）。
+        if measured < win_start or measured > win_end:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"批次拒收：读数 {p.reading_id} 时间 {to_iso(measured)} 超出窗口 "
+                    f"[{to_iso(win_start)}, {to_iso(win_end)}]（两端含）"
+                ),
+            )
+        measured_iso = to_iso(measured)
+        temperature = float(p.temperature)
+
+        cur = active.get(p.reading_id)
+        if cur is not None:
+            if p.revision == cur["revision"]:
+                if cur["measured_at"] != measured_iso or float(cur["temperature"]) != temperature:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"读数 {p.reading_id} 修订号 {p.revision} 已提交但内容冲突："
+                            f"已存 ({cur['measured_at']}, {cur['temperature']})，"
+                            f"本次 ({measured_iso}, {temperature})。相同 ID+修订号重复提交内容必须一致。"
+                        ),
+                    )
+                effect = "idempotent"
+            elif p.revision < cur["revision"]:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"读数 {p.reading_id} 当前修订号为 {cur['revision']}，"
+                        f"拒绝修订号 {p.revision}：旧修订号不能覆盖更高修订号。"
+                    ),
+                )
+            else:
+                effect = "updated"
+            final[p.reading_id] = (p.revision, measured_iso, temperature, effect)
+            continue
+
+        # 无活动行（全新读数，或活动行缺失的历史异常场景）。
+        hist = history.get((p.reading_id, p.revision))
+        if hist is not None:
+            if hist["measured_at"] != measured_iso or float(hist["temperature"]) != temperature:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"读数 {p.reading_id} 修订号 {p.revision} 历史内容冲突："
+                        f"({hist['measured_at']}, {hist['temperature']}) vs "
+                        f"({measured_iso}, {temperature})"
+                    ),
+                )
+            effect = "idempotent"
+            recreate_active.add(p.reading_id)
+        else:
+            effect = "created"
+        final[p.reading_id] = (p.revision, measured_iso, temperature, effect)
+    # ---- 3) 同刻唯一：按批次最终状态校验 ----
+    # 未在批内出现的既有读数保留其当前时刻；互换时刻（两条读数同时更新到
+    # 对方原时刻）在最终状态下不冲突，不按写入顺序误拒。
+    final_time: dict[str, str] = {rid: v[1] for rid, v in final.items()}
+    for rid, row in active.items():
+        final_time.setdefault(rid, row["measured_at"])
+    by_time: dict[str, list[str]] = {}
+    for rid, ts in final_time.items():
+        by_time.setdefault(ts, []).append(rid)
+    for ts, ids in by_time.items():
+        if len(ids) > 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"批次拒收：时刻 {ts} 在最终状态下存在多条读数 "
+                    f"{sorted(ids)}，同一窗口不允许同刻的不同读数"
+                ),
+            )
+
+    # ---- 4) 一次提交全部变化 ----
+    updated_ids = [rid for rid, v in final.items() if v[3] == "updated"]
+    if updated_ids:
+        conn.executemany(
+            "UPDATE reading_revisions SET status='superseded' "
+            "WHERE window_id=? AND reading_id=? AND revision=?",
+            [
+                (window_id, rid, active[rid]["revision"])
+                for rid in updated_ids
+            ],
+        )
+    conn.executemany(
+        """
+        INSERT INTO reading_revisions (window_id, reading_id, revision, measured_at,
+                                       temperature, status)
+        VALUES (?, ?, ?, ?, ?, 'active')
+        """,
+        [
+            (window_id, rid, rev, ts, temp)
+            for rid, (rev, ts, temp, effect) in final.items()
+            if effect in ("created", "updated")
+        ],
+    )
+    # 先删除被替换的活动行、再统一插入：避免“互换时刻”时 readings 的
+    # UNIQUE(window_id, measured_at) 在中间状态误触；同批整事务提交。
+    if updated_ids:
+        conn.executemany(
+            "DELETE FROM readings WHERE window_id=? AND reading_id=?",
+            [(window_id, rid) for rid in updated_ids],
+        )
+    insert_effects = ("created", "updated")
+    try:
+        conn.executemany(
+            """
+            INSERT INTO readings (window_id, reading_id, revision, measured_at, temperature)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (window_id, rid, rev, ts, temp)
+                for rid, (rev, ts, temp, effect) in final.items()
+                if effect in insert_effects or rid in recreate_active
+            ],
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"批次拒收：时间戳与窗口内其它读数同刻，{exc}",
+        )
+
+    rows = conn.execute("SELECT * FROM readings WHERE window_id=?", (window_id,)).fetchall()
+    rows_by_id = {r["reading_id"]: r for r in rows}
+    return [
+        (final[p.reading_id][3], reading_to_dict(rows_by_id[p.reading_id]))
+        for p in payload.readings
+    ]
 
 
 def _insert_active(

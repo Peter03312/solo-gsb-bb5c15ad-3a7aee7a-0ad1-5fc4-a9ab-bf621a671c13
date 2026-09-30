@@ -14,6 +14,8 @@ from .schemas import (
     CertificateOut,
     EvaluationOut,
     IssueRequest,
+    ReadingBatchSubmit,
+    ReadingBatchSubmitResponse,
     ReadingOut,
     ReadingSubmit,
     ReadingSubmitResponse,
@@ -36,11 +38,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
-        "支持读数修订、幂等提交、证书版本化签发，"
+        "支持读数修订、幂等提交（单条与批量补传）、证书版本化签发，"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告。"
     ),
     lifespan=lifespan,
@@ -127,6 +129,39 @@ def submit_reading(
         effect, reading = services.submit_reading(conn, window_id, payload)
         evaluation = services.compute_evaluation(conn, win)
         return {"effect": effect, "reading": reading, "current_evaluation": evaluation}
+
+
+@app.post(
+    "/api/v1/windows/{window_id}/readings/batch",
+    response_model=ReadingBatchSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["readings"],
+)
+def submit_reading_batch(
+    window_id: int,
+    payload: ReadingBatchSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """采样仪器补传：在一个写事务内整批提交非空读数批次。
+
+    - 每项沿用单条提交的 reading_id/revision/measured_at/temperature 语义，
+      以及时区、窗口闭区间边界、幂等/修订/冲突规则；同批 reading_id 不得重复。
+    - 同刻唯一按批次应用后的**最终状态**校验：允许两条读数都以更高修订号
+      互换采样时刻，不按写入顺序误拒。
+    - 任一项冲突（409）或无效（422）整批拒收，活动读数与修订历史均不改变。
+    - 成功时一次提交全部变化，逐项返回 created/updated/idempotent 及读数，
+      并返回按最终状态一次性重算的审定结果；同批重放不产生新修订。
+    """
+    # 单个写事务：整批校验 + 整批落库 + 基于最终状态一次重算
+    with write_transaction(conn):
+        win = services.get_window_row(conn, window_id)
+        results = services.submit_reading_batch(conn, window_id, payload)
+        evaluation = services.compute_evaluation(conn, win)
+        return {
+            "results": [{"effect": effect, "reading": reading}
+                        for effect, reading in results],
+            "current_evaluation": evaluation,
+        }
 
 
 # ---------------------------------------------------------------- 签发

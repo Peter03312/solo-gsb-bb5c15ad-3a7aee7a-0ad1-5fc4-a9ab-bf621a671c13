@@ -68,13 +68,71 @@ echo "== 10. 列出全部证书版本 =="
 api GET "/api/v1/windows/$WID/certificates" | python3 -m json.tool
 
 echo "== 11. 修订影响报告：比对 v1/v2 两张已签发证书的不可变快照 =="
-# 从版本列表取两个证书主键 ID
-mapfile -t CIDS < <(api GET "/api/v1/windows/$WID/certificates" \
-  | python3 -c "import sys,json;print(*[c['id'] for c in json.load(sys.stdin)])")
-OLD_ID="${CIDS[0]}"; NEW_ID="${CIDS[1]}"
+# 从版本列表取两个证书主键 ID（响应只解析一次，避免 api 尾部换行拆词）
+CIDS=$(api GET "/api/v1/windows/$WID/certificates" \
+  | python3 -c "import sys,json;print(' '.join(str(c['id']) for c in json.load(sys.stdin)))")
+read -r OLD_ID NEW_ID <<< "$CIDS"
 api GET "/api/v1/certificates/revision-report?old_certificate_id=$OLD_ID&new_certificate_id=$NEW_ID" \
   | python3 -m json.tool
 
 echo "== 12. 报告拒绝：版本倒序 / 跨窗口 / 同 ID（均 422），不存在 404 =="
 api GET "/api/v1/certificates/revision-report?old_certificate_id=$NEW_ID&new_certificate_id=$OLD_ID" || true
 api GET "/api/v1/certificates/revision-report?old_certificate_id=$OLD_ID&new_certificate_id=99999" || true
+
+echo "== 13. 采样仪器补传：单独建一个窗口演示批量提交（整批事务）=="
+BW=$(api POST /api/v1/windows '{
+  "name": "展柜B-补传",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600
+}')
+BID=$(echo "$BW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 13.1 一次批量创建多条读数（逐项返回 created，并按最终状态重算审定）--"
+api POST "/api/v1/windows/$BID/readings/batch" '{
+  "readings": [
+    {"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.1},
+    {"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":23.0},
+    {"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:20:00Z","temperature":20.2}
+  ]
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('effects:',[x['effect'] for x in d['results']]);print('verdict:',d['current_evaluation']['verdict'])"
+
+echo "-- 13.2 同批重放：全部 idempotent，不产生新修订 --"
+api POST "/api/v1/windows/$BID/readings/batch" '{
+  "readings": [
+    {"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.1},
+    {"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":23.0},
+    {"reading_id":"c","revision":1,"measured_at":"2026-10-01T00:20:00Z","temperature":20.2}
+  ]
+}' | python3 -c "import sys,json;print('effects:',[x['effect'] for x in json.load(sys.stdin)['results']])"
+
+echo "-- 13.3 两条读数以更高修订号互换采样时刻（按最终状态判同刻，顺序无关，均 updated）--"
+api POST "/api/v1/windows/$BID/readings/batch" '{
+  "readings": [
+    {"reading_id":"a","revision":2,"measured_at":"2026-10-01T00:10:00Z","temperature":20.1},
+    {"reading_id":"b","revision":2,"measured_at":"2026-10-01T00:00:00Z","temperature":20.0}
+  ]
+}' | python3 -c "import sys,json;print([(x['reading']['reading_id'],x['effect'],x['reading']['measured_at']) for x in json.load(sys.stdin)['results']])"
+
+echo "-- 13.4 整批拒收：一项 409（b 用旧修订号 rev1）则整批不变（c 不会被创建）--"
+api POST "/api/v1/windows/$BID/readings/batch" '{
+  "readings": [
+    {"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.0},
+    {"reading_id":"x","revision":1,"measured_at":"2026-10-01T00:30:00Z","temperature":20.0}
+  ]
+}' || true
+echo "活动读数（应仍为 a/b/c 三条，无 x）："
+api GET "/api/v1/windows/$BID/readings" \
+  | python3 -c "import sys,json;print(sorted(r['reading_id'] for r in json.load(sys.stdin)))"
+
+echo "-- 13.5 整批拒收：同批 reading_id 重复（422）；空批次也是 422 --"
+api POST "/api/v1/windows/$BID/readings/batch" '{
+  "readings": [
+    {"reading_id":"a","revision":3,"measured_at":"2026-10-01T00:30:00Z","temperature":20.0},
+    {"reading_id":"a","revision":3,"measured_at":"2026-10-01T00:40:00Z","temperature":20.0}
+  ]
+}' || true
+api POST "/api/v1/windows/$BID/readings/batch" '{"readings":[]}' || true
